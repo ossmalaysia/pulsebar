@@ -1,0 +1,5 @@
+*.app
+.DS_Store
+*.csv
+*.log
+*.jsonl
