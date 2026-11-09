@@ -53,18 +53,36 @@ To start it at login, add PulseBar under **System Settings → General → Login
 
 ## WhatsApp alerts via EzyChat
 
-PulseBar calls EzyChat's built-in MCP server (`/mcp`) directly. It sends a single JSON-RPC
-`tools/call` request to `send_message` with a personal access token. Claude or any other AI client
-doesn't need to be running.
+PulseBar signs in to EzyChat's built-in MCP server (`/mcp`) with **OAuth**, the same way claude.ai
+connects to it. You never copy a token. After that, PulseBar sends each alert with one JSON-RPC
+`tools/call` request to `send_message`. Claude or any other AI client doesn't need to be running.
 
-1. In EzyChat, go to **Admin → Settings → Integrations → For developer tools** and create an access token
-   with **Can send WhatsApp messages** turned on.
+1. In EzyChat, go to **Admin → Settings → Integrations** and turn on **Let AI assistants read this inbox**.
 2. From your phone, message your EzyChat WhatsApp number once, so that your number has a chat in the inbox.
-3. In PulseBar, open **Settings…** and enter the MCP address (`https://<your-ezychat>/mcp`), the token and your
-   number with country code. Then click **Send Test Message**.
-4. Set the thresholds and turn on **Send WhatsApp alerts through EzyChat**.
+3. In PulseBar, open **Settings…**, enter your EzyChat address (e.g. `https://<your-ezychat>`, or
+   `localhost:<port>` when EzyChat runs on the same Mac), and click **Connect EzyChat…**.
+4. Your browser opens EzyChat. Sign in as an admin and click **Approve**.
+5. New apps can't send by default. In EzyChat → **Connected apps**, turn on **Can send WhatsApp messages**
+   for PulseBar. Then click **Check Again** in PulseBar, enter your number and click **Send Test Message**.
+6. Set the thresholds and turn on **Send WhatsApp alerts through EzyChat**.
 
-<img src="docs/settings.png" width="420" alt="Settings window">
+<p>
+  <img src="docs/settings-connect.png" width="380" alt="Settings: connect EzyChat">
+  <img src="docs/settings-connected.png" width="380" alt="Settings: connected, sending permission">
+</p>
+
+How the sign-in works (the [MCP authorization](https://modelcontextprotocol.io/specification/draft/basic/authorization) flow):
+
+- **Discovery**: `/.well-known/oauth-protected-resource/mcp` points to the authorization server metadata.
+- **Registration**: PulseBar registers itself as a public client (RFC 7591). It has no client secret.
+- **Approval**: the browser opens the approval page with **PKCE S256**. EzyChat sends the browser back to a
+  one-time loopback address, `http://127.0.0.1:<random port>/callback` (RFC 8252). PulseBar listens there
+  only during sign-in.
+- **Token**: the one-time code and PKCE verifier are exchanged for an app token, which is stored in the
+  **macOS Keychain**. EzyChat issues no refresh token. Access lasts until you remove PulseBar under
+  **Connected apps**, or click **Disconnect** in PulseBar. If EzyChat stops accepting the token,
+  PulseBar shows "Connect" again.
+- EzyChat accepts sign-in only on the same computer or through its tunnel address.
 
 How alerts behave:
 
@@ -79,7 +97,7 @@ How alerts behave:
 
 - History and the alert log stay on your Mac in `~/Library/Application Support/PulseBar/`
   (`history.csv`, `alerts.log`).
-- The EzyChat token is stored in the **macOS Keychain**, not in preferences or files.
+- The EzyChat access from OAuth sign-in is stored in the **macOS Keychain**, not in preferences or files.
 - The only thing sent anywhere is the alert text, which goes to your own EzyChat server. It includes the
   computer name and the names of the top 3 processes.
 
@@ -89,6 +107,7 @@ How alerts behave:
 main.swift      app delegate, menu bar, floating widget, memory/CPU sampling
 history.swift   per-minute recorder, CSV store, history window (Swift Charts)
 alerts.swift    alert engine, EzyChat MCP client, Keychain, settings window
+oauth.swift     EzyChat OAuth sign-in: discovery, client registration, PKCE, loopback redirect
 build.sh        swiftc build + .app bundle (ad-hoc signed)
 ```
 
@@ -102,8 +121,13 @@ Self-tests (no Accessibility permission needed):
 python3 scripts/mock_ezychat_mcp.py 8765 /tmp/sent.jsonl &
 PULSEBAR_HISTORY=/tmp/pb-history.csv PULSEBAR_MCP_URL=http://127.0.0.1:8765/mcp \
 PULSEBAR_TOKEN=ezc_pat_testtoken123 ./PulseBar.app/Contents/MacOS/PulseBar --alerttest
+
+# OAuth sign-in end to end (the authorize page is fetched headlessly instead of opening a browser)
+python3 scripts/mock_ezychat_mcp.py 8770 /tmp/sent.jsonl --grant-send &   # also try --deny, --mcp-off
+PULSEBAR_TOKEN=unused PULSEBAR_EZYCHAT_ADDRESS=127.0.0.1:8770 ./PulseBar.app/Contents/MacOS/PulseBar --oauthtest
 ```
 
+`PULSEBAR_TOKEN` puts the app in test mode: it never reads or writes the real Keychain or EzyChat settings.
 `PULSEBAR_HISTORY` redirects the data files, so tests don't touch your real history.
 `--show-history` and `--show-settings` open those windows at launch.
 

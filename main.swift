@@ -266,6 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--show-history") { historyWindow.show() }
         if CommandLine.arguments.contains("--show-settings") { alertWindow.show() }
         if CommandLine.arguments.contains("--alerttest") { runAlertTest(); return }
+        if CommandLine.arguments.contains("--oauthtest") { runOAuthTest(); return }
         if CommandLine.arguments.contains("--selftest") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.runSelfTest() }
         }
@@ -372,6 +373,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showHistory() { historyWindow.show(metric: .memory) }
     @objc private func showCPUHistory() { historyWindow.show(metric: .cpu) }
     @objc private func showSettings() { alertWindow.show() }
+
+    /// Runs the real OAuth flow against PULSEBAR_EZYCHAT_ADDRESS, but fetches the authorize URL headlessly
+    /// (the server's 302 lands on our loopback listener) instead of opening a browser. Then checks send permission
+    /// and sends one message. Run with PULSEBAR_TOKEN set so the real Keychain/settings are never touched.
+    private func runOAuthTest() {
+        timer?.invalidate()
+        let address = ProcessInfo.processInfo.environment["PULSEBAR_EZYCHAT_ADDRESS"] ?? ""
+        func done(_ line: String) { print(line); fflush(stdout); NSApp.terminate(nil) }
+        Task { @MainActor in
+            let flow = EzyChatOAuth()
+            flow.openBrowser = { url in
+                let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                print("OAUTH authorize \(url.path) [\(q.map(\.name).joined(separator: ","))]")
+                URLSession.shared.dataTask(with: url) { _, _, _ in }.resume()
+            }
+            do {
+                let c = try await flow.connect(address: address, timeout: 10)
+                print("OAUTH connected resource=\(c.mcpURL) client=\(c.clientId) token=\(c.token.prefix(14))…")
+                var s = AlertSettings(); s.mcpURL = c.mcpURL; s.token = c.token; s.phone = "60123456789"
+                let client = try EzyChatClient(settings: s)
+                client.canSend { r in
+                    print("OAUTH canSend: \((try? r.get()).map(String.init(describing:)) ?? "error")")
+                    client.send("PulseBar OAuth test", to: s.phone) { r in
+                        switch r {
+                        case .success: done("OAUTH send: OK")
+                        case .failure(let e): done("OAUTH send: FAILED - \(e.localizedDescription)")
+                        }
+                    }
+                }
+            } catch {
+                done("OAUTH error: \(error.localizedDescription)")
+            }
+        }
+    }
 
     /// Drives the alert engine with simulated time (2 s steps) against PULSEBAR_MCP_URL and prints the log.
     private func runAlertTest() {

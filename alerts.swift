@@ -3,13 +3,17 @@ import SwiftUI
 import Security
 import Combine
 
-// MARK: - Settings (UserDefaults; token in Keychain)
+// MARK: - Settings (UserDefaults; OAuth token in Keychain)
 
 enum AlertKey {
     static let enabled = "alertsEnabled", memEnabled = "alertMemEnabled", cpuEnabled = "alertCpuEnabled"
     static let memBelowGB = "alertMemBelowGB", cpuAbovePct = "alertCpuAbovePct"
     static let sustainMin = "alertSustainMin", cooldownMin = "alertCooldownMin", recovery = "alertSendRecovery"
-    static let mcpURL = "ezychatMcpURL", phone = "ezychatPhone"
+    static let address = "ezychatAddress"            // what the user typed
+    static let mcpURL = "ezychatMcpURL"              // resolved MCP resource, set when connected
+    static let connectedAt = "ezychatConnectedAt"
+    static let canSend = "ezychatCanSend"            // last known: does the app token have inbox:send?
+    static let phone = "ezychatPhone"
 }
 
 struct AlertSettings {
@@ -27,7 +31,7 @@ struct AlertSettings {
         s.cpuEnabled = b(AlertKey.cpuEnabled, s.cpuEnabled); s.sendRecovery = b(AlertKey.recovery, s.sendRecovery)
         s.memBelowGB = n(AlertKey.memBelowGB, s.memBelowGB); s.cpuAbovePct = n(AlertKey.cpuAbovePct, s.cpuAbovePct)
         s.sustainMin = n(AlertKey.sustainMin, s.sustainMin); s.cooldownMin = n(AlertKey.cooldownMin, s.cooldownMin)
-        s.mcpURL = d.string(forKey: AlertKey.mcpURL) ?? ""
+        s.mcpURL = ProcessInfo.processInfo.environment["PULSEBAR_MCP_URL"] ?? d.string(forKey: AlertKey.mcpURL) ?? ""
         s.phone = d.string(forKey: AlertKey.phone) ?? ""
         s.token = Keychain.token
         return s
@@ -35,14 +39,15 @@ struct AlertSettings {
 }
 
 enum Keychain {
-    private static let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                              kSecAttrService as String: "io.github.ossmalaysia.pulsebar.ezychat",
-                                              kSecAttrAccount as String: "accessToken"]
-    /// PULSEBAR_TOKEN overrides the Keychain (used by the self-tests).
+    private static let service = "io.github.ossmalaysia.pulsebar.ezychat"
+    private static func query(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+    }
+    /// The OAuth app token from "Connect EzyChat". PULSEBAR_TOKEN overrides it (self-tests only).
     static var token: String {
         get {
             if let t = ProcessInfo.processInfo.environment["PULSEBAR_TOKEN"] { return t }
-            var q = base
+            var q = query("oauthAccessToken")
             q[kSecReturnData as String] = true
             q[kSecMatchLimit as String] = kSecMatchLimitOne
             var out: CFTypeRef?
@@ -50,25 +55,37 @@ enum Keychain {
             return String(decoding: d, as: UTF8.self)
         }
         set {
-            SecItemDelete(base as CFDictionary)
-            let v = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !v.isEmpty else { return }
-            var q = base
-            q[kSecValueData as String] = Data(v.utf8)
+            if ProcessInfo.processInfo.environment["PULSEBAR_TOKEN"] != nil { return }   // never touch the real Keychain in tests
+            SecItemDelete(query("oauthAccessToken") as CFDictionary)
+            SecItemDelete(query("accessToken") as CFDictionary)   // older builds stored a pasted personal token here
+            guard !newValue.isEmpty else { return }
+            var q = query("oauthAccessToken")
+            q[kSecValueData as String] = Data(newValue.utf8)
             SecItemAdd(q as CFDictionary, nil)
         }
     }
 }
 
+/// Forget the EzyChat connection locally (the app token itself is revoked in EzyChat → Connected apps).
+func disconnectEzyChat() {
+    if ProcessInfo.processInfo.environment["PULSEBAR_TOKEN"] != nil { return }   // self-tests: leave real settings alone
+    Keychain.token = ""
+    let d = UserDefaults.standard
+    [AlertKey.mcpURL, AlertKey.connectedAt, AlertKey.canSend].forEach { d.removeObject(forKey: $0) }
+}
+
 // MARK: - EzyChat MCP client (stateless Streamable HTTP, one JSON-RPC call per request)
 
 enum EzyChatError: LocalizedError {
-    case notConfigured(String), http(Int, String), tool(String), badResponse(String)
+    case notConnected, signedOut, mcpOff, sendOff, notConfigured(String), http(Int, String), tool(String), badResponse(String)
     var errorDescription: String? {
         switch self {
+        case .notConnected: return "Not connected. Open Settings and click “Connect EzyChat…”."
+        case .signedOut: return "EzyChat no longer accepts PulseBar's access (it was removed in Connected apps, or the admin changed). Connect again in Settings."
+        case .mcpOff: return "AI assistant access is off in EzyChat (Admin → Settings → Integrations → “Let AI assistants read this inbox”)."
+        case .sendOff: return "Sending is off for PulseBar. In EzyChat → Admin → Settings → Integrations → Connected apps, turn on “Can send WhatsApp messages” for PulseBar."
         case .notConfigured(let m): return m
-        case .http(401, _): return "Token rejected (401). Check the access token."
-        case .http(403, let b): return "Not allowed (403). Does the token have \u{201C}Can send WhatsApp messages\u{201D}? \(b)"
+        case .http(403, let b): return "Not allowed (403): \(b)"
         case .http(let c, let b): return "HTTP \(c): \(b)"
         case .tool(let m): return m
         case .badResponse(let m): return "Unexpected reply: \(m)"
@@ -81,25 +98,22 @@ struct EzyChatClient {
     let token: String
 
     init(settings s: AlertSettings) throws {
-        guard let u = URL(string: s.mcpURL.trimmingCharacters(in: .whitespaces)), u.scheme?.hasPrefix("http") == true else {
-            throw EzyChatError.notConfigured("Set the EzyChat MCP address (ends with /mcp).")
+        guard !s.token.isEmpty, let u = URL(string: s.mcpURL), u.scheme?.hasPrefix("http") == true else {
+            throw EzyChatError.notConnected
         }
-        guard !s.token.isEmpty else { throw EzyChatError.notConfigured("Set the EzyChat access token (ezc_pat_…).") }
         url = u; token = s.token
     }
 
-    func callTool(_ name: String, _ args: [String: Any], completion: @escaping (Result<String, Error>) -> Void) {
+    /// One JSON-RPC request. Returns the `result` object.
+    func rpc(_ method: String, _ params: [String: Any], completion: @escaping (Result<[String: Any], Error>) -> Void) {
         var req = URLRequest(url: url, timeoutInterval: 20)
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": ["name": name, "arguments": args],
-        ])
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "method": method, "params": params])
         URLSession.shared.dataTask(with: req) { data, resp, err in
-            func finish(_ r: Result<String, Error>) { DispatchQueue.main.async { completion(r) } }
+            func finish(_ r: Result<[String: Any], Error>) { DispatchQueue.main.async { completion(r) } }
             if let err { return finish(.failure(err)) }
             let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
             var body = String(decoding: data ?? Data(), as: UTF8.self)
@@ -108,17 +122,42 @@ struct EzyChatClient {
                let last = body.split(separator: "\n").last(where: { $0.hasPrefix("data:") }) {
                 body = String(last.dropFirst(5)).trimmingCharacters(in: .whitespaces)
             }
-            guard (200..<300).contains(status) else { return finish(.failure(EzyChatError.http(status, String(body.prefix(200))))) }
+            switch status {
+            case 200..<300: break
+            case 401:
+                // The app token was revoked: forget it so the UI shows "Connect" again.
+                DispatchQueue.main.async { disconnectEzyChat() }
+                return finish(.failure(EzyChatError.signedOut))
+            case 404: return finish(.failure(EzyChatError.mcpOff))
+            default: return finish(.failure(EzyChatError.http(status, String(body.prefix(200)))))
+            }
             guard let obj = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any] else {
                 return finish(.failure(EzyChatError.badResponse(String(body.prefix(200)))))
             }
             if let e = obj["error"] as? [String: Any] {
                 return finish(.failure(EzyChatError.tool(e["message"] as? String ?? "MCP error")))
             }
-            let result = obj["result"] as? [String: Any] ?? [:]
-            let text = (result["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: "\n")
-            finish(result["isError"] as? Bool == true ? .failure(EzyChatError.tool(text)) : .success(text))
+            finish(.success(obj["result"] as? [String: Any] ?? [:]))
         }.resume()
+    }
+
+    func callTool(_ name: String, _ args: [String: Any], completion: @escaping (Result<String, Error>) -> Void) {
+        rpc("tools/call", ["name": name, "arguments": args]) { r in
+            completion(r.flatMap { result in
+                let text = (result["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: "\n")
+                guard result["isError"] as? Bool == true else { return .success(text) }
+                // EzyChat hides send tools from tokens without inbox:send, so the SDK says "not found".
+                if text.contains(name) && (text.contains("not found") || text.contains("disabled")) { return .failure(EzyChatError.sendOff) }
+                return .failure(EzyChatError.tool(text))
+            })
+        }
+    }
+
+    /// Whether this token may send (EzyChat only lists send_message for tokens with inbox:send).
+    func canSend(completion: @escaping (Result<Bool, Error>) -> Void) {
+        rpc("tools/list", [:]) { r in
+            completion(r.map { ($0["tools"] as? [[String: Any]] ?? []).contains { $0["name"] as? String == "send_message" } })
+        }
     }
 
     /// `phone` is used as the chat id: EzyChat resolves a phone number to its existing chat.
@@ -317,13 +356,20 @@ struct AlertSettingsView: View {
     @AppStorage(AlertKey.sustainMin) private var sustainMin = 5.0
     @AppStorage(AlertKey.cooldownMin) private var cooldownMin = 30.0
     @AppStorage(AlertKey.recovery) private var sendRecovery = true
+    @AppStorage(AlertKey.address) private var address = ""
     @AppStorage(AlertKey.mcpURL) private var mcpURL = ""
+    @AppStorage(AlertKey.connectedAt) private var connectedAt = 0.0
+    @AppStorage(AlertKey.canSend) private var canSend = false
     @AppStorage(AlertKey.phone) private var phone = ""
-    @State private var token = ""
-    @State private var testStatus = ""
-    @State private var testing = false
+    @State private var connecting = false
+    @State private var oauth: EzyChatOAuth?
+    @State private var status = ""
+    @State private var statusOK = false
+    @State private var busy = false
     @State private var entries: [AlertLogEntry] = []
     private let tick = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+
+    private var connected: Bool { !mcpURL.isEmpty && connectedAt > 0 }
 
     var body: some View {
         Form {
@@ -349,19 +395,53 @@ struct AlertSettingsView: View {
             }
             .disabled(!enabled)
             Section {
-                TextField("MCP address", text: $mcpURL, prompt: Text("https://your-ezychat-address/mcp"))
-                SecureField("Access token", text: $token, prompt: Text("ezc_pat_…"))
-                    .onChange(of: token) { _, v in Keychain.token = v }
-                TextField("Your WhatsApp number", text: $phone, prompt: Text("60123456789"))
-                HStack {
-                    Button(testing ? "Sending…" : "Send Test Message", action: sendTest).disabled(testing)
-                    Text(testStatus).font(.caption).foregroundStyle(testStatus.hasPrefix("✓") ? .green : .red)
-                        .lineLimit(3).textSelection(.enabled)
+                if connected {
+                    LabeledContent("Connected") {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(URL(string: mcpURL)?.host ?? mcpURL).textSelection(.enabled)
+                            Text("since \(Date(timeIntervalSince1970: connectedAt).formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    LabeledContent("Sending") {
+                        HStack(spacing: 8) {
+                            Text(canSend ? "Allowed" : "Off").foregroundStyle(canSend ? .green : .orange)
+                            Button("Check Again", action: checkPermission).disabled(busy).controlSize(.small)
+                        }
+                    }
+                    if !canSend {
+                        Text("In EzyChat → Admin → Settings → Integrations → **Connected apps**, turn on **Can send WhatsApp messages** for PulseBar, then click Check Again.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    TextField("Your WhatsApp number", text: $phone, prompt: Text("60123456789"))
+                    HStack {
+                        Button(busy ? "Sending…" : "Send Test Message", action: sendTest).disabled(busy)
+                        Spacer()
+                        Button("Disconnect", role: .destructive) { disconnectEzyChat(); setStatus("Disconnected. To revoke access completely, remove PulseBar in EzyChat → Connected apps.", ok: true) }
+                    }
+                } else {
+                    TextField("EzyChat address", text: $address, prompt: Text("https://your-ezychat-address  or  localhost:7440"))
+                        .disabled(connecting)
+                    HStack {
+                        if connecting {
+                            ProgressView().controlSize(.small)
+                            Text("Waiting for you to approve in the browser…").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Cancel") { oauth?.cancel() }
+                        } else {
+                            Button("Connect EzyChat…", action: connect).disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                        }
+                    }
+                }
+                if !status.isEmpty {
+                    Text(status).font(.caption).foregroundStyle(statusOK ? .green : .red).textSelection(.enabled)
                 }
             } header: {
                 Text("EzyChat")
             } footer: {
-                Text("Create a token in EzyChat → Admin → Settings → Integrations → For developer tools, with **Can send WhatsApp messages** on. Your number must already have a chat in the inbox (send any message to your EzyChat number once). The token is stored in the macOS Keychain.")
+                Text(connected
+                     ? "Your number must already have a chat in the inbox (send any message to your EzyChat number once)."
+                     : "Connect opens EzyChat in your browser: sign in as an admin and click **Approve**. No token to copy. PulseBar keeps the access it is given in the macOS Keychain. EzyChat must have “Let AI assistants read this inbox” on, and be reached on this Mac or through its tunnel address.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Recent alerts") {
@@ -381,17 +461,52 @@ struct AlertSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(minWidth: 560, minHeight: 600)
-        .onAppear { token = Keychain.token; entries = log.recent() }
+        .onAppear { entries = log.recent() }
         .onReceive(tick) { _ in entries = log.recent() }
     }
 
     private func color(_ event: String) -> Color {
-        switch event { case "alert": .orange; case "recovered": .green; case "failed": .red; default: .secondary }
+        switch event { case "alert", "connected": .orange; case "recovered", "sent": .green; case "failed": .red; default: .secondary }
+    }
+
+    private func setStatus(_ s: String, ok: Bool) { status = s; statusOK = ok }
+
+    private func connect() {
+        let flow = EzyChatOAuth()
+        oauth = flow; connecting = true; setStatus("", ok: true)
+        Task { @MainActor in
+            defer { connecting = false; oauth = nil }
+            do {
+                let c = try await flow.connect(address: address)
+                Keychain.token = c.token
+                mcpURL = c.mcpURL
+                connectedAt = Date().timeIntervalSince1970
+                log.add("EzyChat", "connected", c.mcpURL)
+                NSApp.activate(ignoringOtherApps: true)   // come back from the browser
+                setStatus("✓ Connected.", ok: true)
+                checkPermission()
+            } catch {
+                setStatus(error.localizedDescription, ok: false)
+            }
+        }
+    }
+
+    private func checkPermission() {
+        busy = true
+        do {
+            try EzyChatClient(settings: AlertSettings.load()).canSend { r in
+                busy = false
+                switch r {
+                case .success(let ok): canSend = ok; if ok { setStatus("✓ PulseBar may send WhatsApp messages.", ok: true) }
+                case .failure(let e): setStatus(e.localizedDescription, ok: false)
+                }
+            }
+        } catch { busy = false; setStatus(error.localizedDescription, ok: false) }
     }
 
     private func sendTest() {
         let s = AlertSettings.load()
-        testing = true; testStatus = ""
+        busy = true; setStatus("", ok: true)
         let host = Host.current().localizedName ?? "Mac"
         let text = "✅ PulseBar test from \(host). Alerts: " +
             [s.memEnabled ? String(format: "memory below %g GB", s.memBelowGB) : nil,
@@ -399,15 +514,17 @@ struct AlertSettingsView: View {
             " for \(Int(s.sustainMin)) min."
         do {
             try EzyChatClient(settings: s).send(text, to: s.phone) { r in
-                testing = false
+                busy = false
                 switch r {
-                case .success: testStatus = "✓ Sent. Check WhatsApp."; log.add("Test", "sent", text)
-                case .failure(let e): testStatus = e.localizedDescription; log.add("Test", "failed", e.localizedDescription)
+                case .success: canSend = true; setStatus("✓ Sent. Check WhatsApp.", ok: true); log.add("Test", "sent", text)
+                case .failure(let e):
+                    if case EzyChatError.sendOff = e { canSend = false }
+                    setStatus(e.localizedDescription, ok: false); log.add("Test", "failed", e.localizedDescription)
                 }
                 entries = log.recent()
             }
         } catch {
-            testing = false; testStatus = error.localizedDescription
+            busy = false; setStatus(error.localizedDescription, ok: false)
         }
     }
 }
