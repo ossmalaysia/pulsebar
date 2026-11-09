@@ -57,20 +57,55 @@ PulseBar signs in to EzyChat's built-in MCP server (`/mcp`) with **OAuth**, the 
 connects to it. You never copy a token. After that, PulseBar sends each alert with one JSON-RPC
 `tools/call` request to `send_message`. Claude or any other AI client doesn't need to be running.
 
-1. In EzyChat, go to **Admin → Settings → Integrations** and turn on **Let AI assistants read this inbox**.
-2. From your phone, message your EzyChat WhatsApp number once, so that your number has a chat in the inbox.
-3. In PulseBar, open **Settings…**, enter your EzyChat address (e.g. `https://<your-ezychat>`, or
-   `localhost:<port>` when EzyChat runs on the same Mac), and click **Connect EzyChat…**.
-4. Your browser opens EzyChat. Sign in as an admin and click **Approve**.
-5. New apps can't send by default. In EzyChat → **Connected apps**, turn on **Can send WhatsApp messages**
-   for PulseBar. Then click **Check Again** in PulseBar, enter your number and click **Send Test Message**.
-   If your EzyChat has more than one WhatsApp number (inbox), choose the one alerts come from under **Send from**.
-6. Set the thresholds and turn on **Send WhatsApp alerts through EzyChat**.
+### Before you start
+
+- You can sign in to EzyChat as an **admin**.
+- EzyChat is reachable from this Mac: on the same computer (`localhost:<port>`), or through its public or
+  tunnel address (`https://…`).
+- Your own WhatsApp number has a chat in the inbox. EzyChat only sends into chats that already exist, so if
+  you've never messaged your EzyChat number, send it any message from your phone first.
+
+### Setup (about 2 minutes)
+
+| # | Where | Do this |
+|---|---|---|
+| 1 | EzyChat → **Admin → Settings → Integrations** | Turn on **Let AI assistants read this inbox**. |
+| 2 | PulseBar menu → **Settings… (⌘,)** | Under **EzyChat**, enter the address (e.g. `https://<your-ezychat>` or `localhost:<port>`) and click **Connect EzyChat…**. |
+| 3 | Browser | EzyChat opens. Sign in as an admin and click **Approve**. You're sent back to PulseBar, which shows **Connected**. |
+| 4 | EzyChat → **Integrations → Connected apps** | New apps can only read. Turn on **Can send WhatsApp messages** for **PulseBar**. |
+| 5 | PulseBar Settings | Click **Check Again**. **Sending** should change to **Allowed**. |
+| 6 | PulseBar Settings | Enter your WhatsApp number with the country code (e.g. `60123456789`). If EzyChat has more than one WhatsApp number, choose the one alerts come from under **Send from**. |
+| 7 | PulseBar Settings | Click **Send Test Message**. You should get a WhatsApp message within a few seconds. |
+| 8 | PulseBar Settings | Set the thresholds under **When to alert**, then turn on **Send WhatsApp alerts through EzyChat** at the top. |
+
+The first time PulseBar reads its saved access (and again after you rebuild it), macOS may ask
+*"PulseBar wants to use your confidential information stored in … keychain"*. Enter your Mac login password
+and click **Always Allow**.
 
 <p>
   <img src="docs/settings-connect.png" width="380" alt="Settings: connect EzyChat">
   <img src="docs/settings-connected.png" width="380" alt="Settings: connected, sending permission">
 </p>
+
+### Troubleshooting
+
+Every message PulseBar sends, or fails to send, is listed under **Recent alerts** in Settings.
+
+| PulseBar says | What to do |
+|---|---|
+| *AI assistant access is off in EzyChat* | Do step 1. EzyChat hides every MCP and sign-in address while this is off. |
+| *Sending is off for PulseBar* | Do step 4, then click **Check Again**. |
+| *Your number has a chat in more than one EzyChat inbox* | Choose a number under **Send from** (step 6). EzyChat won't guess which WhatsApp number to send from. |
+| *No chat found for …* | Your number has no chat in that inbox. Message the EzyChat number from your phone once, or pick the other inbox under **Send from**. |
+| *EzyChat no longer accepts PulseBar's access* | PulseBar was removed in **Connected apps**, or the admin who approved it changed. Click **Connect EzyChat…** again. |
+| *The connection was denied in EzyChat* | **Deny** was clicked on the approval page. Connect again and click **Approve**. |
+| The browser page says the address can't be reached | Check the address. EzyChat only accepts sign-in on the same computer or through its tunnel address, not by LAN IP. |
+| Test works but no alerts arrive | Check that the switch at the top of Settings is on and the thresholds are reachable. Alerts need the limit to be crossed on average for the whole window (default 5 min). |
+
+To disconnect, click **Disconnect** in PulseBar. To revoke the access completely, also remove PulseBar in
+EzyChat → **Connected apps**.
+
+### Under the hood
 
 How the sign-in works (the [MCP authorization](https://modelcontextprotocol.io/specification/draft/basic/authorization) flow):
 
@@ -93,6 +128,10 @@ How alerts behave:
   past the limit (memory ≥ limit + 1 GB, CPU ≤ limit − 10 points), so a value sitting near the line doesn't flap.
 - If sending fails (bad token, server unreachable), PulseBar retries after 5 min. Every attempt is shown
   under **Recent alerts**.
+
+How the chat is picked: with one WhatsApp number, PulseBar passes your phone number and EzyChat finds its
+chat. With several, it addresses the chat in the chosen inbox directly: `<phone>@s.whatsapp.net` for inbox 1,
+`<phone>@s.whatsapp.net#<inboxId>` for the others. The list of numbers comes from `get_stats` (`byInbox`).
 
 ## Privacy
 
