@@ -14,6 +14,7 @@ enum AlertKey {
     static let connectedAt = "ezychatConnectedAt"
     static let canSend = "ezychatCanSend"            // last known: does the app token have inbox:send?
     static let phone = "ezychatPhone"
+    static let inboxId = "ezychatInboxId"          // WhatsApp number to send from; 0 = the only one / automatic
 }
 
 struct AlertSettings {
@@ -21,6 +22,7 @@ struct AlertSettings {
     var memBelowGB = 4.0, cpuAbovePct = 90.0
     var sustainMin = 5.0, cooldownMin = 30.0
     var mcpURL = "", phone = "", token = ""
+    var inboxId = 0
 
     static func load() -> AlertSettings {
         let d = UserDefaults.standard
@@ -33,6 +35,7 @@ struct AlertSettings {
         s.sustainMin = n(AlertKey.sustainMin, s.sustainMin); s.cooldownMin = n(AlertKey.cooldownMin, s.cooldownMin)
         s.mcpURL = ProcessInfo.processInfo.environment["PULSEBAR_MCP_URL"] ?? d.string(forKey: AlertKey.mcpURL) ?? ""
         s.phone = d.string(forKey: AlertKey.phone) ?? ""
+        s.inboxId = d.integer(forKey: AlertKey.inboxId)
         s.token = Keychain.token
         return s
     }
@@ -71,19 +74,20 @@ func disconnectEzyChat() {
     if ProcessInfo.processInfo.environment["PULSEBAR_TOKEN"] != nil { return }   // self-tests: leave real settings alone
     Keychain.token = ""
     let d = UserDefaults.standard
-    [AlertKey.mcpURL, AlertKey.connectedAt, AlertKey.canSend].forEach { d.removeObject(forKey: $0) }
+    [AlertKey.mcpURL, AlertKey.connectedAt, AlertKey.canSend, AlertKey.inboxId].forEach { d.removeObject(forKey: $0) }
 }
 
 // MARK: - EzyChat MCP client (stateless Streamable HTTP, one JSON-RPC call per request)
 
 enum EzyChatError: LocalizedError {
-    case notConnected, signedOut, mcpOff, sendOff, notConfigured(String), http(Int, String), tool(String), badResponse(String)
+    case notConnected, signedOut, mcpOff, sendOff, inboxRequired, notConfigured(String), http(Int, String), tool(String), badResponse(String)
     var errorDescription: String? {
         switch self {
         case .notConnected: return "Not connected. Open Settings and click “Connect EzyChat…”."
         case .signedOut: return "EzyChat no longer accepts PulseBar's access (it was removed in Connected apps, or the admin changed). Connect again in Settings."
         case .mcpOff: return "AI assistant access is off in EzyChat (Admin → Settings → Integrations → “Let AI assistants read this inbox”)."
         case .sendOff: return "Sending is off for PulseBar. In EzyChat → Admin → Settings → Integrations → Connected apps, turn on “Can send WhatsApp messages” for PulseBar."
+        case .inboxRequired: return "Your number has a chat in more than one EzyChat inbox. Choose the WhatsApp number to send from under “Send from” in Settings."
         case .notConfigured(let m): return m
         case .http(403, let b): return "Not allowed (403): \(b)"
         case .http(let c, let b): return "HTTP \(c): \(b)"
@@ -148,6 +152,8 @@ struct EzyChatClient {
                 guard result["isError"] as? Bool == true else { return .success(text) }
                 // EzyChat hides send tools from tokens without inbox:send, so the SDK says "not found".
                 if text.contains(name) && (text.contains("not found") || text.contains("disabled")) { return .failure(EzyChatError.sendOff) }
+                // A phone number with a chat in several inboxes (WhatsApp numbers) is never sent from a guessed one.
+                if text.contains("inbox_required") { return .failure(EzyChatError.inboxRequired) }
                 return .failure(EzyChatError.tool(text))
             })
         }
@@ -160,13 +166,43 @@ struct EzyChatClient {
         }
     }
 
-    /// `phone` is used as the chat id: EzyChat resolves a phone number to its existing chat.
-    func send(_ text: String, to phone: String, completion: @escaping (Result<String, Error>) -> Void) {
+    /// The team's WhatsApp numbers (inboxes). Empty when there is only one: get_stats lists `byInbox`
+    /// only for a reader with more than one active inbox.
+    func inboxes(completion: @escaping (Result<[EzyChatInbox], Error>) -> Void) {
+        callTool("get_stats", ["days": 1]) { r in
+            completion(r.map { text in
+                let obj = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any]
+                return (obj?["byInbox"] as? [[String: Any]] ?? []).compactMap { row in
+                    guard let id = row["inboxId"] as? Int else { return nil }
+                    return EzyChatInbox(id: id, name: row["name"] as? String ?? "Inbox \(id)")
+                }
+            })
+        }
+    }
+
+    /// The chat id of `digits` in `inboxId`, the way EzyChat keys chats: inbox 1 keeps the plain WhatsApp
+    /// JID, other inboxes add `#<inboxId>`. With no inbox chosen, the bare number lets EzyChat find the chat,
+    /// which works while the number has a chat in only one inbox.
+    static func chatId(digits: String, inboxId: Int) -> String {
+        switch inboxId {
+        case ..<1: return digits
+        case 1: return "\(digits)@s.whatsapp.net"
+        default: return "\(digits)@s.whatsapp.net#\(inboxId)"
+        }
+    }
+
+    func send(_ text: String, to phone: String, inboxId: Int = 0, completion: @escaping (Result<String, Error>) -> Void) {
         let digits = phone.filter(\.isNumber)
         guard digits.count >= 7 else { return completion(.failure(EzyChatError.notConfigured("Set your WhatsApp number (with country code)."))) }
         let requestId = "pb-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        callTool("send_message", ["jid": digits, "text": text, "requestId": requestId], completion: completion)
+        callTool("send_message", ["jid": Self.chatId(digits: digits, inboxId: inboxId), "text": text, "requestId": requestId],
+                 completion: completion)
     }
+}
+
+struct EzyChatInbox: Identifiable, Hashable {
+    let id: Int
+    let name: String
 }
 
 // MARK: - Alert log (tab-separated, next to history.csv)
@@ -289,7 +325,7 @@ final class AlertEngine {
 
     private func deliver(_ k: Kind, _ event: String, _ text: String, _ s: AlertSettings, done: @escaping (Bool) -> Void) {
         do {
-            try EzyChatClient(settings: s).send(text, to: s.phone) { [weak self] r in
+            try EzyChatClient(settings: s).send(text, to: s.phone, inboxId: s.inboxId) { [weak self] r in
                 switch r {
                 case .success: self?.log.add(k.rawValue, event, text); done(true)
                 case .failure(let e): self?.log.add(k.rawValue, "failed", "\(event): \(e.localizedDescription)"); done(false)
@@ -361,6 +397,8 @@ struct AlertSettingsView: View {
     @AppStorage(AlertKey.connectedAt) private var connectedAt = 0.0
     @AppStorage(AlertKey.canSend) private var canSend = false
     @AppStorage(AlertKey.phone) private var phone = ""
+    @AppStorage(AlertKey.inboxId) private var inboxId = 0
+    @State private var inboxes: [EzyChatInbox] = []
     @State private var connecting = false
     @State private var oauth: EzyChatOAuth?
     @State private var status = ""
@@ -414,10 +452,19 @@ struct AlertSettingsView: View {
                             .font(.caption).foregroundStyle(.orange)
                     }
                     TextField("Your WhatsApp number", text: $phone, prompt: Text("60123456789"))
+                    if inboxes.count > 1 || inboxId > 0 {
+                        Picker("Send from", selection: $inboxId) {
+                            if inboxId == 0 { Text("Choose a WhatsApp number…").tag(0) }
+                            ForEach(inboxes) { Text($0.name).tag($0.id) }
+                            if inboxId > 0 && !inboxes.contains(where: { $0.id == inboxId }) {
+                                Text("Inbox \(inboxId)").tag(inboxId)   // not listed (yet, or removed)
+                            }
+                        }
+                    }
                     HStack {
                         Button(busy ? "Sending…" : "Send Test Message", action: sendTest).disabled(busy)
                         Spacer()
-                        Button("Disconnect", role: .destructive) { disconnectEzyChat(); setStatus("Disconnected. To revoke access completely, remove PulseBar in EzyChat → Connected apps.", ok: true) }
+                        Button("Disconnect", role: .destructive) { disconnectEzyChat(); inboxes = []; setStatus("Disconnected. To revoke access completely, remove PulseBar in EzyChat → Connected apps.", ok: true) }
                     }
                 } else {
                     TextField("EzyChat address", text: $address, prompt: Text("https://your-ezychat-address  or  localhost:7440"))
@@ -461,7 +508,7 @@ struct AlertSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(minWidth: 560, minHeight: 600)
-        .onAppear { entries = log.recent() }
+        .onAppear { entries = log.recent(); if connected { loadInboxes() } }
         .onReceive(tick) { _ in entries = log.recent() }
     }
 
@@ -484,7 +531,9 @@ struct AlertSettingsView: View {
                 log.add("EzyChat", "connected", c.mcpURL)
                 NSApp.activate(ignoringOtherApps: true)   // come back from the browser
                 setStatus("✓ Connected.", ok: true)
+                inboxId = 0
                 checkPermission()
+                loadInboxes()
             } catch {
                 setStatus(error.localizedDescription, ok: false)
             }
@@ -504,6 +553,18 @@ struct AlertSettingsView: View {
         } catch { busy = false; setStatus(error.localizedDescription, ok: false) }
     }
 
+    /// Lists the team's WhatsApp numbers; with several, the user picks the one alerts are sent from.
+    private func loadInboxes() {
+        guard let client = try? EzyChatClient(settings: AlertSettings.load()) else { return }
+        client.inboxes { r in
+            guard case .success(let list) = r else { return }   // a failure shows up on Check Again / Send Test
+            inboxes = list
+            if list.count > 1 && inboxId == 0 {
+                setStatus("This EzyChat has \(list.count) WhatsApp numbers. Choose the one to send from.", ok: false)
+            }
+        }
+    }
+
     private func sendTest() {
         let s = AlertSettings.load()
         busy = true; setStatus("", ok: true)
@@ -513,12 +574,13 @@ struct AlertSettingsView: View {
              s.cpuEnabled ? String(format: "CPU above %g%%", s.cpuAbovePct) : nil].compactMap { $0 }.joined(separator: ", ") +
             " for \(Int(s.sustainMin)) min."
         do {
-            try EzyChatClient(settings: s).send(text, to: s.phone) { r in
+            try EzyChatClient(settings: s).send(text, to: s.phone, inboxId: s.inboxId) { r in
                 busy = false
                 switch r {
                 case .success: canSend = true; setStatus("✓ Sent. Check WhatsApp.", ok: true); log.add("Test", "sent", text)
                 case .failure(let e):
                     if case EzyChatError.sendOff = e { canSend = false }
+                    if case EzyChatError.inboxRequired = e { loadInboxes() }
                     setStatus(e.localizedDescription, ok: false); log.add("Test", "failed", e.localizedDescription)
                 }
                 entries = log.recent()

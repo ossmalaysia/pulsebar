@@ -395,11 +395,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let client = try EzyChatClient(settings: s)
                 client.canSend { r in
                     print("OAUTH canSend: \((try? r.get()).map(String.init(describing:)) ?? "error")")
-                    client.send("PulseBar OAuth test", to: s.phone) { r in
-                        switch r {
-                        case .success: done("OAUTH send: OK")
-                        case .failure(let e): done("OAUTH send: FAILED - \(e.localizedDescription)")
+                    client.inboxes { r in
+                        let list = (try? r.get()) ?? []
+                        print("OAUTH inboxes: \(list.map { "\($0.id)=\($0.name)" }.joined(separator: ", "))")
+                        func send(_ inbox: Int, then: (() -> Void)? = nil) {
+                            client.send("PulseBar OAuth test", to: s.phone, inboxId: inbox) { r in
+                                switch r {
+                                case .success: print("OAUTH send (inbox \(inbox)): OK")
+                                case .failure(let e): print("OAUTH send (inbox \(inbox)): FAILED - \(e.localizedDescription)")
+                                }
+                                if let then { then() } else { done("OAUTH done") }
+                            }
                         }
+                        // Several inboxes: no choice must be refused, then the chosen one must work.
+                        if let last = list.last, list.count > 1 { send(0) { send(last.id) } } else { send(0) }
                     }
                 }
             } catch {

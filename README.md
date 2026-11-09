@@ -64,6 +64,7 @@ connects to it. You never copy a token. After that, PulseBar sends each alert wi
 4. Your browser opens EzyChat. Sign in as an admin and click **Approve**.
 5. New apps can't send by default. In EzyChat → **Connected apps**, turn on **Can send WhatsApp messages**
    for PulseBar. Then click **Check Again** in PulseBar, enter your number and click **Send Test Message**.
+   If your EzyChat has more than one WhatsApp number (inbox), choose the one alerts come from under **Send from**.
 6. Set the thresholds and turn on **Send WhatsApp alerts through EzyChat**.
 
 <p>
@@ -123,7 +124,7 @@ PULSEBAR_HISTORY=/tmp/pb-history.csv PULSEBAR_MCP_URL=http://127.0.0.1:8765/mcp 
 PULSEBAR_TOKEN=ezc_pat_testtoken123 ./PulseBar.app/Contents/MacOS/PulseBar --alerttest
 
 # OAuth sign-in end to end (the authorize page is fetched headlessly instead of opening a browser)
-python3 scripts/mock_ezychat_mcp.py 8770 /tmp/sent.jsonl --grant-send &   # also try --deny, --mcp-off
+python3 scripts/mock_ezychat_mcp.py 8770 /tmp/sent.jsonl --grant-send &   # also try --deny, --mcp-off, --inboxes
 PULSEBAR_TOKEN=unused PULSEBAR_EZYCHAT_ADDRESS=127.0.0.1:8770 ./PulseBar.app/Contents/MacOS/PulseBar --oauthtest
 ```
 

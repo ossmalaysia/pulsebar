@@ -6,11 +6,13 @@ clients, redirect URIs that are https or loopback http, matched exactly), PKCE S
 send permission (send_message is hidden from tools/list and "not found" on tools/call).
 
 Usage:
-  python3 scripts/mock_ezychat_mcp.py PORT SENT_LOG [--grant-send] [--deny] [--mcp-off]
+  python3 scripts/mock_ezychat_mcp.py PORT SENT_LOG [--grant-send] [--deny] [--mcp-off] [--inboxes]
 
   --grant-send  OAuth app tokens may send (as if "Can send WhatsApp messages" was turned on)
   --deny        the admin clicks "Deny" on the approval page
   --mcp-off     AI assistant access is off: every MCP/OAuth route answers 404
+  --inboxes     two WhatsApp numbers (inboxes 1 and 2), every phone has a chat in both: a bare phone
+                number is refused with inbox_required, like EzyChat; a chat key picks the inbox
 
 The static token ezc_pat_testtoken123 (used by --alerttest) always may send.
 """
@@ -26,6 +28,22 @@ LOOPBACK = {"localhost", "127.0.0.1", "[::1]"}
 clients = {}                                       # client_id -> {"redirect_uris": [...]}
 codes = {}                                         # code -> {client_id, redirect_uri, challenge, expires}
 tokens = {"ezc_pat_testtoken123": {"send"}}        # token -> scopes
+INBOXES = {1: "Sales", 2: "Support"} if "--inboxes" in FLAGS else {1: "Main"}
+
+
+def resolve_chat(jid):
+    """(inbox id, error) the way EzyChat's findChats resolves a send_message jid."""
+    if "#" in jid:
+        wa, _, suffix = jid.partition("#")
+        ok = suffix.isdigit() and int(suffix) in INBOXES and suffix != "1" and wa.endswith("@s.whatsapp.net")
+        return (int(suffix), None) if ok else (None, f"No chat found for {jid}.")
+    if "@" in jid:
+        return 1, None                                  # inbox 1 keeps the plain JID
+    if len(INBOXES) > 1:
+        rows = ", ".join(f"{jid}@s.whatsapp.net{'' if i == 1 else '#%d' % i} (inbox {i}, {n})" for i, n in INBOXES.items())
+        return None, (f"inbox_required: {jid} has a chat in more than one inbox (WhatsApp number); "
+                      f"pass the chat id of the one you mean: {rows}.")
+    return 1, None
 
 
 def valid_redirect(u):
@@ -160,11 +178,19 @@ class H(BaseHTTPRequestHandler):
         if p.get("name") not in tools:   # how the MCP SDK answers a tool the token can't see
             return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"isError": True, "content": [
                 {"type": "text", "text": f"MCP error -32602: Tool {p.get('name')} not found"}]}})
+        if p.get("name") == "get_stats":
+            stats = {"open": 3, "resolved": 9}
+            if len(INBOXES) > 1:
+                stats["byInbox"] = [{"inboxId": i, "name": n, "open": 1, "resolved": 4} for i, n in INBOXES.items()]
+            return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": json.dumps(stats)}]}})
         ok = re.fullmatch(r"[A-Za-z0-9_-]{8,64}", a.get("requestId", "")) and a.get("jid") and 1 <= len(a.get("text", "")) <= 4096
         if not ok:
             return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"isError": True, "content": [{"type": "text", "text": "invalid_arguments"}]}})
+        inbox, err = resolve_chat(a["jid"])
+        if err:
+            return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"isError": True, "content": [{"type": "text", "text": err}]}})
         with open(LOG, "a") as f:
-            f.write(json.dumps({"jid": a["jid"], "requestId": a["requestId"], "text": a["text"]}) + "\n")
+            f.write(json.dumps({"jid": a["jid"], "inbox": inbox, "requestId": a["requestId"], "text": a["text"]}) + "\n")
         return self.reply(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [
             {"type": "text", "text": json.dumps({"messageId": "tmp-1", "queued": False})}]}})
 
